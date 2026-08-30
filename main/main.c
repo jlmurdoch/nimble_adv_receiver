@@ -7,6 +7,17 @@
 #include "nimble/nimble_port.h" // nimble_port_run
 #include "nimble/nimble_port_freertos.h" // nimble_port_freertos_init
 
+#define BLE_UUID16_APPLE  0x004C
+#define BLE_UUID16_BTHOME 0xFCD2
+
+#define BTHOME_PACKET_ID    0x00
+#define BTHOME_BATTERY      0x01
+#define BTHOME_ILLUMINANCE  0x05
+#define BTHOME_MOTION       0x21
+#define BTHOME_WINDOW       0x2D
+#define BTHOME_BUTTON       0x3A
+#define BTHOME_ROTATION     0x3F
+
 void nimble_host_task(void *param)
 {
     // This runs until nimble_port_stop() is issued 
@@ -23,61 +34,128 @@ static void nimble_sync_callback(void) {
     assert(ret == 0);
 }
 
-static void ibeacon_parse(const uint8_t *data, uint8_t len) {
-    // iBeacon Header is just an 0xFF (Manufacturers data)
-    // 02       - header size
-    // 01 06    - flags 
-    // 1A       - 26 bytes 
-    // FF       - mfg_data
-    
-    // 4C 00 - 004C (Apple)
-    if ((data[0] == 0x4C) && (data[1] == 0x00)) {
-        // 02 - ibeacon
-        // 15 - 21 bytes 
-        if ((data[2] == 0x02) && (data[3] == 0x15)) {
-            // AA 11 BB 22 CC 33 DD 44 EE 55 FF 66 00 77 11 88 - UUID
-            // 00 00 - 16-bit major id
-            // 00 00 - 16-bit minor id 
-            // C5    - Tx Power 
-            printf("\tUUID: ");
-            for (int i = 4; i < 20; i++) {
-                printf("%02x ", data[i]);
+static void ble_bthome_parse_adv_data(const uint8_t *data, uint8_t data_len) {
+    printf("\tRaw service data: ");
+    for (int i = 0; i < data_len; i++) {
+        printf("%02X ", data[i]);
+    }
+    printf("\n");
+
+    // Is it BTHome v2 (0x40 >> 5)?
+    // https://bthome.io/format/
+    if ((data[2] >> 5) == 0x2) {
+        printf("\t");
+        for (int i = 3; i < data_len; i++) {
+            switch (data[i++]) {
+                
+            case BTHOME_PACKET_ID: // Packet ID (counter)
+                printf("PacketID=%d, ", data[i]);
+            break;
+
+            case BTHOME_BATTERY: // Battery (percentage)
+                printf("Battery%%=%d, ", data[i]);
+            break;
+
+            case BTHOME_ILLUMINANCE: // Illuminance (lux)
+                // 0x13, 0x8A, 0x14 = 13460.67 lx
+                printf("Illuminance=%0.2f, ", (float)(((uint32_t)data[i]) | ((uint32_t)data[i+1] << 8) | ((uint32_t)data[i+2] << 16)) * 0.01);
+                i += 2; // Three-bytes, so increment another two
+            break;
+
+            case BTHOME_MOTION: // Motion: Yes/No
+                printf("Motion=%d, ", data[i]);
+            break;
+
+            case BTHOME_WINDOW: // Window / door: Open/Close
+                printf("Window=%d, ", data[i]);
+            break;
+
+            case BTHOME_ROTATION: // Rotation (degrees)
+                // 0x02, 0x0C = 307.4 degrees
+                printf("Rotation=%0.1f, ", (float)(((uint16_t)data[i]) | ((uint16_t)data[i+1] << 8)) * 0.1);
+                i++; // Two-bytes, so increment another one
+            break;
+
+            case BTHOME_BUTTON: // Button (press)
+                printf("Button=%d, ", data[i]);
+            break;
+
+            default:
+                // Maybe do something here? 
+            break;
             }
-            printf("\n");
-            printf("\tMajor ID: %02x %02x\n", data[20], data[21]);
-            printf("\tMinor ID: %02x %02x\n", data[22], data[23]);
-            printf("\tTx Power: %d dBm\n", (int8_t)data[24]);
         }
+        printf("\n");
     }
 }
 
-static int adv_gap_event_callback(struct ble_gap_event *event, void *arg) {
+static void ble_ibeacon_parse_adv_data(const uint8_t *data, uint8_t data_len) {
+    /*
+     * An iBeacon Header is custom manufacturer data on a BLE ADV.
+     * The setting (not reading) of this data is visible in:
+     * https://github.com/espressif/esp-nimble/blob/master/nimble/host/src/ble_ibeacon.c
+     *
+     * -- BLE ADV
+     * 02       - Header size in Bytes
+     * 01 06    - Flags LE (0x6 = General Discoverable Mode, BR/EDR Not Supported)
+     * 1A       - Advertisement length (26 bytes)
+     * FF       - Manufacturer Data (AKA mfg_data)
+     * -- Custom Manufacturer Data
+     * 4C 00    - Apple (004C, Little Endian)
+     * 02       - iBeacon type
+     * 15       - iBeacon length (21 bytes) 
+     * -- Apple iBeacon Data
+     * AA 11 .. - 128-bit UUID
+     * 00 00    - Major ID 
+     * 00 00    - Minor ID
+     * C5       - Tx Power (8-bit signed integer) 
+     */
+
+    // Check to see if expected iBeacon indicator (Type 2, 21 bytes)
+    if ((data[2] == 0x02) && (data[3] == 0x15)) {
+        printf("\tUUID: ");
+        for (int i = 4; i < 20; i++) {
+            printf("%02x ", data[i]);
+        }
+        printf("\n");
+        printf("\tMajor ID: %02x %02x\n", data[20], data[21]);
+        printf("\tMinor ID: %02x %02x\n", data[22], data[23]);
+        printf("\tTx Power: %d dBm\n", (int8_t)data[24]);
+    }
+}
+
+static int ble_adv_gap_event_callback(struct ble_gap_event *event, void *arg) {
     if (event->type == BLE_GAP_EVENT_DISC) {
         struct ble_gap_disc_desc *ar = &event->disc;
         struct ble_hs_adv_fields adv_fields;
 
-        // Limit to just very local devices i.e. -45dBm > -0.1dBm
+        // Limit to just very local devices (i.e. -45dBm > -0.1dBm)
         if (ar->rssi < -45) {
             return 0;
         }
 
+        // Parse out any fields - flags is expected at a minimum
         if (ble_hs_adv_parse_fields(&adv_fields, event->disc.data, event->disc.length_data) != 0) {
             return 0;
         }
 
+        // Print the Bluetooth address
         printf("Advertisement from: %02X:%02X:%02X:%02X:%02X:%02X\n",
           ar->addr.val[5], ar->addr.val[4], ar->addr.val[3],
           ar->addr.val[2], ar->addr.val[1], ar->addr.val[0]
         );
 
+        // Print RSSI value
         printf("- RSSI: %d dBm\n", ar->rssi);
 
+        // Print the whole packet for debug purposes
         printf("- Raw Data: ");
         for (int i = 0; i < ar->length_data; i++) {
             printf("%02X ", ar->data[i]);
         }
         printf("\n");
 
+        // Now look for other data
         printf("- Parsed Data:\n");
 
         if (adv_fields.num_uuids16 > 0) {
@@ -94,6 +172,9 @@ static int adv_gap_event_callback(struct ble_gap_event *event, void *arg) {
 
         if (adv_fields.svc_data_uuid16 != NULL) {
             printf("  * Service Data - 16-bit UUID present\n");
+            if ((adv_fields.svc_data_uuid16[0] | ((uint16_t)adv_fields.svc_data_uuid16[1] << 8)) == BLE_UUID16_BTHOME) {
+                ble_bthome_parse_adv_data(adv_fields.svc_data_uuid16, adv_fields.svc_data_uuid16_len);
+            }
         }
 
         if (adv_fields.svc_data_uuid32 != NULL) {
@@ -114,14 +195,16 @@ static int adv_gap_event_callback(struct ble_gap_event *event, void *arg) {
                 printf("%02X ", adv_fields.mfg_data[i]);
             }
             printf("\n");
-            ibeacon_parse(adv_fields.mfg_data, adv_fields.mfg_data_len);
+            if ((adv_fields.mfg_data[0] | ((uint16_t)adv_fields.mfg_data[1] << 8)) == BLE_UUID16_APPLE) {
+                ble_ibeacon_parse_adv_data(adv_fields.mfg_data, adv_fields.mfg_data_len);
+            }
         }
     }
 
     return 0;
 }
 
-void adv_discover(void) {
+void ble_adv_discover(void) {
     // Configuration for scanning for GAP messages
     struct ble_gap_disc_params disc_params = { 
         // .filter_duplicates = 1, // Filter out duplicates
@@ -129,7 +212,7 @@ void adv_discover(void) {
     };
 
     // Scan passively (so no address needed) and forever 
-    int ret = ble_gap_disc(0, BLE_HS_FOREVER, &disc_params, adv_gap_event_callback, NULL);
+    int ret = ble_gap_disc(0, BLE_HS_FOREVER, &disc_params, ble_adv_gap_event_callback, NULL);
     if (ret != 0) { return; }
 }
 
@@ -161,5 +244,5 @@ void app_main(void)
     nimble_port_freertos_init(nimble_host_task);
 
     // Start scanning
-    adv_discover();
+    ble_adv_discover();
 }
