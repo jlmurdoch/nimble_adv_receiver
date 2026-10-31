@@ -13,10 +13,25 @@
 #define BTHOME_PACKET_ID    0x00
 #define BTHOME_BATTERY      0x01
 #define BTHOME_ILLUMINANCE  0x05
+#define BTHOME_VOLTAGE_A    0x0C
+#define BTHOME_POWER        0x10
 #define BTHOME_MOTION       0x21
 #define BTHOME_WINDOW       0x2D
 #define BTHOME_BUTTON       0x3A
 #define BTHOME_ROTATION     0x3F
+#define BTHOME_CURRENT_B    0x5D
+
+int16_t unpack_int16(uint8_t first, uint8_t second) {
+    uint16_t bits = ((uint16_t)first << 8) | (uint16_t)second;
+    if (bits <= INT16_MAX) 
+    {
+        return (int16_t)bits;
+    }
+    else
+    {
+        return (int16_t)((int32_t)bits - 65536);
+    }
+}
 
 void nimble_host_task(void *param)
 {
@@ -56,7 +71,7 @@ static void ble_bthome_parse_adv_data(const uint8_t *data, uint8_t data_len) {
                 printf("Battery%%=%d, ", data[i]);
             break;
 
-            case BTHOME_ILLUMINANCE: // Illuminance (lux)
+            case BTHOME_ILLUMINANCE: // Illuminance (lux) / uint24_t
                 // 0x13, 0x8A, 0x14 = 13460.67 lx
                 printf("Illuminance=%0.2f, ", (float)(((uint32_t)data[i]) | ((uint32_t)data[i+1] << 8) | ((uint32_t)data[i+2] << 16)) * 0.01);
                 i += 2; // Three-bytes, so increment another two
@@ -70,14 +85,31 @@ static void ble_bthome_parse_adv_data(const uint8_t *data, uint8_t data_len) {
                 printf("Window=%d, ", data[i]);
             break;
 
-            case BTHOME_ROTATION: // Rotation (degrees)
-                // 0x02, 0x0C = 307.4 degrees
-                printf("Rotation=%0.1f, ", (float)(((uint16_t)data[i]) | ((uint16_t)data[i+1] << 8)) * 0.1);
+            case BTHOME_ROTATION: // Rotation (degrees) / int16_t
+                // 0x02, 0x0C = 307.4 degrees 
+                // See https://sw23.github.io/fp-conv/formats/int16.html
+                printf("Rotation=%0.1f, ", unpack_int16(data[i], data[i+1]) * 0.1);
                 i++; // Two-bytes, so increment another one
             break;
 
             case BTHOME_BUTTON: // Button (press)
                 printf("Button=%d, ", data[i]);
+            break;
+
+            case BTHOME_POWER: // Power (on/off)
+                printf("Power=%d, ", data[i]);
+            break;
+
+            case BTHOME_VOLTAGE_A: // Voltage 0.000V / uint16_t
+                // 0x02, 0x0C = 3.074 volts
+                printf("VoltageA=%0.3f, ", (float)(((uint16_t)data[i] << 8) | ((uint16_t)data[i+1])) * 0.001);
+                i++; // Two-bytes, so increment another one
+            break;
+
+            case BTHOME_CURRENT_B: // Amperes 0.000A / int16_t
+                // 0x02, 0xEA = -5.63 Amps
+                printf("CurrentB=%0.3f, ", unpack_int16(data[i], data[i+1]) * 0.001);
+                i++; // Two-bytes, so increment another one
             break;
 
             default:
@@ -204,15 +236,54 @@ static int ble_adv_gap_event_callback(struct ble_gap_event *event, void *arg) {
     return 0;
 }
 
+// Optimised BTHome specific example
+static int bthome_event_callback(struct ble_gap_event *event, void *arg) {
+    if (event->type == BLE_GAP_EVENT_DISC) {
+        struct ble_gap_disc_desc *ar = &event->disc;
+        struct ble_hs_adv_fields adv_fields;
+
+        // Parse out any fields - flags is expected at a minimum
+        if (ble_hs_adv_parse_fields(&adv_fields, event->disc.data, event->disc.length_data) != 0) {
+            return 0;
+        }
+
+        if (adv_fields.svc_data_uuid16 != NULL) {
+            if ((adv_fields.svc_data_uuid16[0] | ((uint16_t)adv_fields.svc_data_uuid16[1] << 8)) == BLE_UUID16_BTHOME) {
+                // Print the Bluetooth address
+                printf("Advertisement from: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                    ar->addr.val[5], ar->addr.val[4], ar->addr.val[3],
+                    ar->addr.val[2], ar->addr.val[1], ar->addr.val[0]
+                );
+                
+                // Print RSSI value
+                printf("- RSSI: %d dBm\n", ar->rssi);
+
+                // Print the whole packet for debug purposes
+                printf("- Raw Data: ");
+                for (int i = 0; i < ar->length_data; i++) {
+                    printf("%02X ", ar->data[i]);
+                }
+                printf("\n");
+
+                ble_bthome_parse_adv_data(adv_fields.svc_data_uuid16, adv_fields.svc_data_uuid16_len);
+            }
+        }
+    }
+
+    return 0;
+}
+
 void ble_adv_discover(void) {
     // Configuration for scanning for GAP messages
     struct ble_gap_disc_params disc_params = { 
-        // .filter_duplicates = 1, // Filter out duplicates
+        .filter_duplicates = 1, // Filter out duplicates - Remove if testing
         .passive = 1 // Scan passively
     };
 
     // Scan passively (so no address needed) and forever 
     int ret = ble_gap_disc(0, BLE_HS_FOREVER, &disc_params, ble_adv_gap_event_callback, NULL);
+    // Example of making it BTHome specific
+    // int ret = ble_gap_disc(0, BLE_HS_FOREVER, &disc_params, bthome_event_callback, NULL);
     if (ret != 0) { return; }
 }
 
@@ -242,6 +313,9 @@ void app_main(void)
 
     // Start NimBLE host stack in FreeRTOS task
     nimble_port_freertos_init(nimble_host_task);
+
+    printf("Waiting for stack to start\n");
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
 
     // Start scanning
     ble_adv_discover();

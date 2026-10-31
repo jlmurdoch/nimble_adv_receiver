@@ -7,6 +7,16 @@ What needs to be configured:
 - `CONFIG_BT_NIMBLE_ENABLED=y` - Nimble Enabled
 - `CONFIG_BT_NIMBLE_50_FEATURE_SUPPORT=n` - Bluetooth 5.0 disabled
 
+For duplicate filtering, it is best to make it very granular - Device and Data:
+- `CONFIG_BTDM_SCAN_DUPL_TYPE_DATA_DEVICE=y`
+- `CONFIG_BTDM_BLE_SCAN_DUPL=y`
+- `CONFIG_BTDM_SCAN_DUPL_TYPE_DEVICE=n`
+- `CONFIG_BTDM_SCAN_DUPL_TYPE_DATA=n`
+- `CONFIG_BTDM_SCAN_DUPL_TYPE_DATA_DEVICE=y`
+- `CONFIG_BTDM_SCAN_DUPL_TYPE=2`
+
+If the ADV changes by one byte, then the BLE will show it. 
+
 If a BLE ADV sender is needed, see [this BLE one-shot repo](https://github.com/jlmurdoch/nimble_adv_one_shot) or [Apache Newt's example for iBeacon](https://mynewt.apache.org/latest/tutorials/ble/ibeacon.html).
 
 ## iBeacon
